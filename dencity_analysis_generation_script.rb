@@ -14,7 +14,7 @@ begin
 rescue Faraday::ParsingError => user_id_failure
   fail "Error in user_id field: #{user_id_failure.message}"
 rescue MultiJson::ParseError => authentication_failure
-  fail "Error in attempted authentication: #{login_failure.message}"
+  fail "Error in attempted authentication: #{authentication_failure.message}"
 end
 user_uuid = r.id
 
@@ -45,7 +45,7 @@ prov_fields = %w(uuid created_at name display_name description)
 provenance = a.select { |key, _| prov_fields.include? key }
 provenance['user_defined_id'] = local_analysis_uuid
 provenance['user_created_date'] = Time.now
-provenance['analysis_types'] = a['problem']['analysis_type']
+provenance['analysis_types'] = [a['problem']['analysis_type']]
 measure_metadata = []
 if a['problem']
 

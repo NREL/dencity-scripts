@@ -31,7 +31,7 @@ class DencityFileUpload < OpenStudio::Ruleset::ReportingUserScript
     # DEnCIty server user id's password
     auth_code = OpenStudio::Ruleset::OSArgument::makeStringArgument('auth_code', true)
     auth_code.setDisplayName('Authentication code for User ID on DEnCity server')
-    args << user_id
+    args << auth_code
 
     # Building type for DEnCity's metadata
     file_path = OpenStudio::Ruleset::OSArgument::makeStringArgument('file_path', true)
@@ -39,9 +39,9 @@ class DencityFileUpload < OpenStudio::Ruleset::ReportingUserScript
     args << file_path
 
     # Name of the file in DEnCity
-    dencity_file_name = OpenStudio::Ruleset::OSArgument::makeOptionalStringArgument('dencity_file_name', true)
+    dencity_file_name = OpenStudio::Ruleset::OSArgument::makeStringArgument('dencity_file_name', false)
     dencity_file_name.setDisplayName('DEnCity File Name')
-    args << file_path
+    args << dencity_file_name
 
     args
 
@@ -62,7 +62,7 @@ class DencityFileUpload < OpenStudio::Ruleset::ReportingUserScript
     file_path = runner.getStringArgumentValue('file_path', user_arguments)
 
     # Check connection to hostname and authenticate connection
-    conn = Dencity.connect({hostname: hostname})
+    conn = Dencity.connect({host_name: hostname})
     runner.registerError "Could not connect to DEnCity server at #{hostname}." unless conn.connected?
     begin
       r = conn.login(user_id, auth_code)
@@ -71,20 +71,21 @@ class DencityFileUpload < OpenStudio::Ruleset::ReportingUserScript
     rescue MultiJson::ParseError => authentication_failure
       runner.registerError "Error in attempted authentication: #{authentication_failure.message}"
     end
+    user_uuid = r.id
 
     # Check that the file exists
     runner.registerError("Could not find file #{file_path}.") unless File.exists? file_path
 
     # Check dencity_file_name, and if not initialized set to the file_path file name.
-    runner.getOptionalStringArgumentValue('dencity_file_name', user_arguments)
-      building_type.is_initialized? ? building_type = building_type.get : building_type = nil
-    end
+    dencity_file_name = runner.getOptionalStringArgumentValue('dencity_file_name', user_arguments)
+    dencity_file_name.is_initialized ? dencity_file_name = dencity_file_name.get : dencity_file_name = File.basename(file_path)
+    runner.registerInfo("DEnCity file name is #{dencity_file_name}")
 
     # Find the structure id
-    measure_results = runner.results
-    if measure_results.keys.include? 'dencity_datapoint_upload'
-      if measure_results['dencity_datapoint_upload'].keys.include? 'structure_id'
-        structure_id = measure_results['dencity_datapoint_upload']['structure_id']
+    measure_results = runner.past_results
+    if measure_results.keys.include? 'dencity_datapoint_upload'.to_sym
+      if measure_results['dencity_datapoint_upload'.to_sym].keys.include? 'structure_id'.to_sym
+        structure_id = measure_results['dencity_datapoint_upload'.to_sym]['structure_id'.to_sym]
       else
         runner.registerError 'Could not find the `structure_id` field in the `dencity_datapoint_upload` measure results.'
       end
@@ -93,23 +94,32 @@ class DencityFileUpload < OpenStudio::Ruleset::ReportingUserScript
     end
 
     # Get the structure object
-    structure = conn.dencity_get "structures/#{structure_id}"
-    runner.registerError('Unable to retrieve structure from DEnCity server.') unless structure.status == 200
+    begin
+      structure_hash = conn.dencity_get "structures/#{structure_id}"
+    rescue
+      runner.registerError('Unable to retrieve structure from DEnCity server.')
+    end
 
     # Upload the file
     begin
-      structure_responce = structure.upload_file(file_path)
+      structure_obj = conn.load_structure()
+      r = structure_obj.load_raw_json(MultiJson.dump(structure_hash))
+      runner.registerError("Could not load the json from #{hostname} for structure #{structure_id} into the structure object") unless r
+      r = structure_obj.upload_file(file_path)
     rescue StandardError => e
       runner.registerError("Upload failure: #{e.message} in #{e.backtrace.join('/n')}")
     else
-      runner.registerInfo "Successfully uploaded #{file_path} to the DEnCity server for structure #{structure_id}."
-      runner.registerInfo "Push responce: #{structure_response}"
+      runner.registerInfo("#{r}")
+      if r.status.to_s[0] == '2'
+        runner.registerInfo("Successfully uploaded file (#{file_path}) to the DEnCity server for structure #{structure_id} with id #{r.id}.")
+      else
+        runner.registerError("ERROR: Server returned a non-2xx status. Response was: #{r}")
+      end
     end
 
     true
 
   end
-
 end
 
 DencityFileUpload.new.registerWithApplication

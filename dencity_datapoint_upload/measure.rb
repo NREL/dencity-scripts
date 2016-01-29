@@ -32,15 +32,15 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
     # DEnCIty server user id's password
     auth_code = OpenStudio::Ruleset::OSArgument::makeStringArgument('auth_code', true)
     auth_code.setDisplayName('Authentication code for User ID on DEnCity server')
-    args << user_id
+    args << auth_code
 
     # Building type for DEnCity's metadata
-    building_type = OpenStudio::Ruleset::OSArgument::makeOptionalStringArgument('building_type', true)
+    building_type = OpenStudio::Ruleset::OSArgument::makeStringArgument('building_type', false)
     building_type.setDisplayName('Building type')
     args << building_type
 
     # HVAC system for DEnCity's metadata
-    primary_hvac = OpenStudio::Ruleset::OSArgument::makeOptionalStringArgument('primary_hvac', true)
+    primary_hvac = OpenStudio::Ruleset::OSArgument::makeStringArgument('primary_hvac', false)
     primary_hvac.setDisplayName('Primary HVAC system in building')
     args << primary_hvac
 
@@ -62,9 +62,11 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
     auth_code = runner.getStringArgumentValue('auth_code', user_arguments)
 
     # Check connection to hostname and authenticate connection
-    conn = Dencity.connect({hostname: hostname})
+    conn = Dencity.connect({host_name: hostname})
     runner.registerError "Could not connect to DEnCity server at #{hostname}." unless conn.connected?
+    r = nil
     begin
+      runner.registerInfo("Attempting to log into #{hostname} with user ID #{user_id}")
       r = conn.login(user_id, auth_code)
     rescue Faraday::ParsingError => user_id_failure
       runner.registerError "Error in user_id field: #{user_id_failure.message}"
@@ -75,13 +77,13 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
 
     # Unpack DEnCity metadata fields
     building_type = runner.getOptionalStringArgumentValue('building_type', user_arguments)
-    building_type.is_initialized? ? building_type = building_type.get : building_type = nil
+    building_type.is_initialized ? building_type = building_type.get : building_type = nil
     primary_hvac = runner.getOptionalStringArgumentValue('primary_hvac', user_arguments)
-    primary_hvac.is_initialized? ? primary_hvac = primary_hvac.get : primary_hvac = nil
+    primary_hvac.is_initialized ? primary_hvac = primary_hvac.get : primary_hvac = nil
 
     # Check that the analysis has already been registered with the DEnCity instance. This should be replaced with a
     # 'retrieve_analysis_by_user_defined_id' method in the future
-    local_analysis_uuid = File.basename(File.absolute_path(File.join(File.dirname(__FILE__),'..'))).gsub('analysis_','')
+    local_analysis_uuid = runner.analysis[:analysis][:_id]
     user_analyses = []
     r = conn.dencity_get 'analyses'
     runner.registerError('Unable to retrieve analyses from DEnCity server') unless r['status'] == 200
@@ -93,7 +95,7 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
     user_analyses.each do |analysis_id|
       analysis = conn.retrieve_analysis_by_id(analysis_id)
       if analysis['user_defined_id'] == local_analysis_uuid
-        dencity_id = analysis['user_defined_id']
+        dencity_id = analysis['id']
         found_analysis_uuid = true
         break
       end
@@ -118,7 +120,7 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
           m_instance[:arguments] = {}
           if wf[:variables]
             wf[:variables].each do |var|
-              m_instance[:arguments][var[:argument][:name]] = var_uuid_hash[var[:uuid]]
+              m_instance[:arguments][var[:argument][:name]] = var_uuid_hash[var[:uuid].to_sym]
             end
           end
           wf[:arguments].each do |arg|
@@ -131,16 +133,18 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
     end
     structure_hash['measure_instances'] = measure_instances
 
-    # Identify if the dencity.csv file exists, and if so parse it into the structure field
+    # Check for available results to push into the database
     structure_results = {}
-    measure_results = runner.results
-    if measure_results.keys.include? 'dencity_reports'
-      results_to_parse = measure_results['dencity_reports']
+#=begin
+    measure_results = runner.past_results
+    runner.registerInfo("Previous results keys: #{measure_results.keys}")
+    if measure_results.keys.include? 'dencity_reports'.to_sym
+      results_to_parse = measure_results['dencity_reports'.to_sym]
       results_to_parse.keys.each do |res|
-        next if res.include? 'units'
+        next if res.to_s.include? 'units'
         puts "res: #{res}"
         puts "results_to_parse[res]: #{results_to_parse[res]}"
-        structure_results[res] = results_to_parse[res]
+        structure_results[res.to_s] = results_to_parse[res].to_s
       end
     else
       runner.registerInfo('Could not find dencity_reports key in results hash. Not attaching results metadata.')
@@ -148,6 +152,7 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
     structure_results['building_type'] = building_type if building_type != nil
     structure_results['primary_hvac'] = primary_hvac if primary_hvac != nil
     structure_hash['structure'] = structure_results
+#=end
 
     # Write the datapoint's structure_hash to structure.json
     f = File.open('structure.json', 'wb')
@@ -155,18 +160,21 @@ class DencityDatapointUpload < OpenStudio::Ruleset::ReportingUserScript
     f.close
 
     # Push the structure.json file to DEnCity
-    structure = dencity_client.load_structure(dencity_id, local_analysis_uuid, 'structure.json')
+    structure = conn.load_structure(dencity_id, runner.datapoint[:data_point][:_id], './structure.json')
     begin
       structure_response = structure.push
     rescue StandardError => e
       runner.registerError("Upload failure: #{e.message} in #{e.backtrace.join('/n')}")
     else
-      runner.registerInfo 'Successfully uploaded processed analysis json file to the DEnCity server.'
-      runner.registerInfo "Push responce: #{structure_response}"
+      if structure_response.status.to_s[0] == '2'
+        runner.registerInfo('Successfully uploaded processed structure json file to the DEnCity server.')
+      else
+        runner.registerError("ERROR: Server returned a non-2xx status. Response was: #{structure_response}")
+      end
     end
 
     # Register the structure id so that other measures can upload files to the structure
-    runner.registerValue("structure_id", structure_response.id, "m2")
+    runner.registerValue("structure_id", "Structure ID", structure_response.structure.id)
 
     true
 
